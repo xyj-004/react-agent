@@ -1,20 +1,14 @@
 from tools.web_search import web_search
 from tools.translator import translate
+import re
 
 TOOLS = {
-    "web_search": {
-        "func": web_search,
-        "desc": "用Bing搜索互联网获取最新信息。输入：搜索关键词（用中文）"
-    },
-    "translate": {
-        "func": translate,
-        "desc": "将英文翻译成中文。输入：需要翻译的英文文本"
-    }
+    "web_search": {"func": web_search, "desc": "用Bing搜索互联网获取最新信息"},
+    "translate":  {"func": translate,  "desc": "将英文翻译成中文"}
 }
 
 def parse_action(text: str):
-    action = None
-    action_input = None
+    action, action_input = None, None
     for line in text.strip().split("\n"):
         if line.startswith("Action:"):
             action = line.replace("Action:", "").strip()
@@ -22,15 +16,34 @@ def parse_action(text: str):
             action_input = line.replace("Action Input:", "").strip()
     return action, action_input
 
+def extract_keyword(question: str) -> str:
+    q = re.sub(r'^(what is|what are|how to|why is|who is|tell me about)', '', question, flags=re.IGNORECASE)
+    q = re.sub(r'\?$', '', q).strip()
+    return q + " 介绍"
+
+def extract_best_snippet(search_result: str) -> str:
+    """从搜索结果里取最有价值的摘要（第一条非空摘要）"""
+    blocks = search_result.split("---")
+    for block in blocks:
+        lines = block.strip().split("\n")
+        for line in lines:
+            if line.startswith("摘要:"):
+                snippet = line.replace("摘要:", "").strip()
+                # 去掉 HTML 实体
+                snippet = re.sub(r'&#\d+;', '', snippet)
+                snippet = re.sub(r'&[a-zA-Z]+;', '', snippet)
+                if len(snippet) > 20:
+                    return snippet
+    return search_result[:200]
+
 def call_llm(messages: list, step: int) -> str:
     user_q = messages[1]["content"]
 
     if step == 1:
-        # 把问题翻译成中文关键词再搜索
-        translated_q = translate(user_q)
-        return f"""Thought: 我需要先把问题翻译成中文，再用中文搜索
+        keyword = extract_keyword(user_q)
+        return f"""Thought: 提取关键词进行搜索
 Action: web_search
-Action Input: {translated_q}"""
+Action Input: {keyword}"""
 
     if step == 2:
         search_result = ""
@@ -38,19 +51,27 @@ Action Input: {translated_q}"""
             if msg["role"] == "user" and "Observation:" in msg["content"]:
                 search_result = msg["content"].replace("Observation:", "").strip()
                 break
-        to_translate = search_result[:400]
-        return f"""Thought: 我得到了搜索结果，整理成最终答案
+        best = extract_best_snippet(search_result)
+        return f"""Thought: 取最佳摘要翻译成中文
 Action: translate
-Action Input: {to_translate}"""
+Action Input: {best}"""
 
     if step == 3:
         observations = []
         for msg in messages:
             if msg["role"] == "user" and "Observation:" in msg["content"]:
                 observations.append(msg["content"].replace("Observation:", "").strip())
-        result = observations[-1] if observations else "暂无结果"
-        return f"""Thought: 我现在有足够信息了
-Final Answer: {result}"""
+        # 搜索结果 + 翻译结果合并
+        search_res = observations[0] if len(observations) > 0 else ""
+        translated  = observations[1] if len(observations) > 1 else ""
+        
+        # 从搜索结果提取标题列表
+        titles = re.findall(r'标题: (.+)', search_res)
+        title_list = "\n".join([f"  - {t}" for t in titles[:3]])
+        
+        final = f"【翻译摘要】{translated}\n\n【相关来源】\n{title_list}"
+        return f"""Thought: 整合信息给出最终答案
+Final Answer: {final}"""
 
     return "Final Answer: 无法完成任务"
 
@@ -59,17 +80,8 @@ def run_agent(user_question: str) -> str:
     print(f"用户问题: {user_question}")
     print(f"{'='*50}")
 
-    tools_desc = "\n".join([f"- {name}: {info['desc']}" for name, info in TOOLS.items()])
-    system_prompt = f"""你是一个智能助手，必须按顺序使用工具：
-1. 先用 web_search 搜索（用中文关键词）
-2. 再用 translate 整理结果
-3. 最后给出中文答案
-
-可用工具：
-{tools_desc}
-"""
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": "你是智能助手"},
         {"role": "user", "content": user_question}
     ]
 
@@ -98,5 +110,5 @@ def run_agent(user_question: str) -> str:
     return "Agent 未能完成任务"
 
 if __name__ == "__main__":
-    result = run_agent("What is the latest version of Python?")
+    result = run_agent("What is PyTorch?")
     print(f"\n最终返回: {result}")
